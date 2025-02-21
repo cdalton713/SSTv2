@@ -141,6 +141,8 @@ export interface FunctionProps
     | "logRetention"
     | "ephemeralStorageSize"
   > {
+
+  code?: Code,
   /**
    * Used to configure additional files to copy into the function bundle
    *
@@ -1020,17 +1022,22 @@ export class Function extends CDKFunction implements SSTConstruct {
         ...props,
         ...(props.runtime === "container"
           ? {
-              code: Code.fromInline("export function placeholder() {}"),
-              handler: "index.placeholder",
-              runtime: CDKRuntime.NODEJS_22_X,
-              layers: undefined,
-            }
-          : {
-              code: Code.fromInline("export function placeholder() {}"),
-              handler: "index.placeholder",
-              runtime: CDKRuntime.NODEJS_22_X,
-              layers: Function.buildLayers(scope, id, props),
-            }),
+            code: Code.fromInline("export function placeholder() {}"),
+            handler: "index.placeholder",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: undefined,
+          }
+          : props.code ? {
+            code: props.code,
+            handler: "index.handler",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: Function.buildLayers(scope, id, props),
+          } : {
+            code: Code.fromInline("export function placeholder() {}"),
+            handler: "index.placeholder",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: Function.buildLayers(scope, id, props),
+          }),
         architecture,
         functionName,
         memorySize,
@@ -1048,19 +1055,29 @@ export class Function extends CDKFunction implements SSTConstruct {
             `➜  Building the container image for the "${this.node.id}" function...`
           );
 
-        // Build function
-        const result = await useRuntimeHandlers().build(
-          this.node.addr,
-          "deploy"
-        );
+        let result: { type: "error", errors: string[] } | {
+          out: string,
+          sourcemap: string | undefined,
+          type: "success",
+          handler: string,
+          errors?: undefined
+        } | null = null;
 
-        if (result.type === "error") {
-          throw new VisibleError(
-            [
-              `Failed to build function "${props.handler}"`,
-              ...result.errors,
-            ].join("\n")
+        if (!props.code) {
+          // Build function
+          result = await useRuntimeHandlers().build(
+            this.node.addr,
+            "deploy"
           );
+
+          if (result.type === "error") {
+            throw new VisibleError(
+              [
+                `Failed to build function "${props.handler}"`,
+                ...result.errors,
+              ].join("\n")
+            );
+          }
         }
 
         // Update function code for container
@@ -1099,31 +1116,37 @@ export class Function extends CDKFunction implements SSTConstruct {
         }
 
         // Update function code for non-container
-        if (result.sourcemap) {
-          const data = await fs.readFile(result.sourcemap);
-          await fs.writeFile(result.sourcemap, zlib.gzipSync(data));
-          const asset = new Asset(this, this.id + "-Sourcemap", {
-            path: result.sourcemap,
-          });
-          await fs.rm(result.sourcemap);
-          useFunctions().sourcemaps.add(stack.stackName, {
-            asset,
-            tarKey: this.functionArn,
-          });
+        if (result){
+          if (result.sourcemap) {
+            const data = await fs.readFile(result.sourcemap);
+            await fs.writeFile(result.sourcemap, zlib.gzipSync(data));
+            const asset = new Asset(this, this.id + "-Sourcemap", {
+              path: result.sourcemap,
+            });
+            await fs.rm(result.sourcemap);
+            useFunctions().sourcemaps.add(stack.stackName, {
+              asset,
+              tarKey: this.functionArn,
+            });
+          }
+          this.missingSourcemap = !result.sourcemap;
         }
-        this.missingSourcemap = !result.sourcemap;
 
         // Update code
-        const code = AssetCode.fromAsset(result.out);
-        const codeConfig = code.bind(this);
+        if (result) {
+          const code = AssetCode.fromAsset(result.out);
+          const codeConfig = code.bind(this);
 
-        cfnFunction.code = {
-          s3Bucket: codeConfig.s3Location?.bucketName,
-          s3Key: codeConfig.s3Location?.objectKey,
-          s3ObjectVersion: codeConfig.s3Location?.objectVersion,
-        };
-        cfnFunction.handler = result.handler;
-        code.bindToResource(cfnFunction);
+          cfnFunction.code = {
+            s3Bucket: codeConfig.s3Location?.bucketName,
+            s3Key: codeConfig.s3Location?.objectKey,
+            s3ObjectVersion: codeConfig.s3Location?.objectVersion,
+          };
+          cfnFunction.handler = result.handler;
+          code.bindToResource(cfnFunction);
+        } else {
+          cfnFunction.handler = 'index.mjs';
+        }
 
         // Update runtime
         // @ts-ignore - override "runtime" private property
@@ -1296,7 +1319,7 @@ export class Function extends CDKFunction implements SSTConstruct {
   }
 
   private createSecretPrefetcher() {
-    const { prefetchSecrets } = this.props;
+    const {prefetchSecrets} = this.props;
     if (!prefetchSecrets) return;
 
     const stack = Stack.of(this) as Stack;
